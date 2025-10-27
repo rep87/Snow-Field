@@ -1,5 +1,5 @@
-import './lib/perlin.js';
-import { AudioMix } from './lib/audio.js';
+import { perlin2 } from './lib/perlin.js';
+import AudioMix from './lib/audio.js';
 
 const canvas = document.getElementById('scene');
 const ctx = canvas.getContext('2d');
