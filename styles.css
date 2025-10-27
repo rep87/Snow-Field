@@ -16,6 +16,11 @@ body {
   height: 100vh;
 }
 
+canvas {
+  image-rendering: pixelated;
+  image-rendering: crisp-edges;
+}
+
 .visually-hidden {
   position: absolute;
   width: 1px;
