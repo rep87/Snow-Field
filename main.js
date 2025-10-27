@@ -1,31 +1,45 @@
 import { perlin2 } from './lib/perlin.js';
 import AudioMix from './lib/audio.js';
 
-const CAM = { horizonRatio: 0.6, heroScaleBase: 1.12 };
-const COLORS = {
+const CAM = { horizonRatio: 0.6, targetXRatio: 0.5, targetYRatio: 0.72 };
+const heroScale = 1.35;
+const PAL = {
   skyTop: '#F2F5F8',
   skyBot: '#E7ECEF',
   snowTop: '#DEE6EE',
   snowBot: '#CFD9E3',
-  fogNear: 0.18,
-  fogFar: 0.55,
+  navy: '#1F2933',
+  navy2: '#2A3946',
+  gun: '#0F1720',
+  fog: 'rgba(255,255,255,0.28)',
 };
+const PIXEL_SCALE = 4;
 
 const canvas = document.getElementById('scene');
 const ctx = canvas.getContext('2d');
+const lo = document.createElement('canvas');
+const loCtx = lo.getContext('2d', { alpha: true });
 const hudInfo = document.getElementById('hud-info');
 const btnAudio = document.getElementById('btn-audio');
 
-let dpr = window.devicePixelRatio || 1;
-let width = window.innerWidth || canvas.clientWidth || 1;
-let height = window.innerHeight || canvas.clientHeight || 1;
-let horizonY = height * CAM.horizonRatio;
+let width = 1;
+let height = 1;
+let horizonY = 1;
 
 const state = {
   time: 0,
   lastFrame: performance.now(),
   groundOffset: 0,
-  walk: { base: 80, jitterAmp: 0.08, noiseT: Math.random() * 10 },
+  walk: {
+    base: 80,
+    jitterAmp: 0.08,
+    noiseT: Math.random() * 10,
+    phase: Math.random() * Math.PI * 2,
+    bobAmp: 10,
+    swayAmp: 8,
+    bob: 0,
+    sway: 0,
+  },
   stepTimer: 0,
   fps: 60,
   fpsFilter: 0.12,
@@ -43,21 +57,32 @@ heroImage.onload = () => {
 heroImage.onerror = () => {};
 heroImage.src = './assets/sprites/hero_waist_back.png';
 
-window.__heroScale = CAM.heroScaleBase;
+window.__heroScale = heroScale;
 
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
 function resize() {
-  dpr = window.devicePixelRatio || 1;
-  width = window.innerWidth || document.documentElement.clientWidth || canvas.clientWidth || 1;
-  height = window.innerHeight || document.documentElement.clientHeight || canvas.clientHeight || 1;
-  horizonY = height * CAM.horizonRatio;
-  canvas.width = Math.max(1, Math.floor(width * dpr));
-  canvas.height = Math.max(1, Math.floor(height * dpr));
-  canvas.style.width = `${width}px`;
-  canvas.style.height = `${height}px`;
+  const viewW = window.innerWidth || document.documentElement.clientWidth || canvas.clientWidth || 1;
+  const viewH = window.innerHeight || document.documentElement.clientHeight || canvas.clientHeight || 1;
+  const loW = Math.max(320, Math.round(viewW / PIXEL_SCALE));
+  const loH = Math.max(180, Math.round(viewH / PIXEL_SCALE));
+
+  lo.width = loW;
+  lo.height = loH;
+  canvas.width = loW * PIXEL_SCALE;
+  canvas.height = loH * PIXEL_SCALE;
+  canvas.style.width = `${viewW}px`;
+  canvas.style.height = `${viewH}px`;
+
+  ctx.imageSmoothingEnabled = false;
+  loCtx.imageSmoothingEnabled = false;
+
+  width = loW;
+  height = loH;
+  horizonY = Math.round(height * CAM.horizonRatio);
+
   rebuildFlakes();
 }
 
@@ -70,143 +95,163 @@ function rebuildFlakes() {
 
 function makeFlake(x, y) {
   const depth = Math.random();
+  const size = Math.max(1, Math.min(3, Math.round(1 + depth * 2)));
+  const speed = 14 + depth * 28;
   return {
     x,
     y,
     depth,
-    size: 1.2 + depth * 2.4,
-    speed: 24 + depth * 62,
+    size,
+    speed,
   };
 }
 
 function updateFlakes(dt, wind) {
   for (const flake of flakes) {
-    flake.y += (flake.speed + state.walk.base * 0.08) * dt;
-    flake.x += wind * dt * (0.4 + flake.depth * 0.8);
+    const fallFactor = 0.7 + flake.depth * 0.5;
+    flake.y += (flake.speed * fallFactor + state.walk.base * 0.05) * dt;
+    const drift = wind * (0.35 + flake.depth * 0.65) + state.walk.sway * 0.06;
+    flake.x += drift * dt;
 
     if (flake.y > height) {
-      flake.y = horizonY - Math.random() * 40;
+      flake.y = horizonY - Math.random() * 20;
       flake.x = Math.random() * width;
     }
-    if (flake.x < -20) {
-      flake.x = width + 20 * Math.random();
-    } else if (flake.x > width + 20) {
-      flake.x = -20 * Math.random();
+    if (flake.x < -10) {
+      flake.x = width + 10 * Math.random();
+    } else if (flake.x > width + 10) {
+      flake.x = -10 * Math.random();
     }
+  }
+}
+
+function ditherFill(yStart, yEnd, colorA, colorB) {
+  const start = Math.max(0, Math.floor(yStart));
+  const end = Math.min(height, Math.ceil(yEnd));
+  for (let y = start; y < end; y += 1) {
+    const useB = (y & 1) === 0;
+    loCtx.fillStyle = useB ? colorB : colorA;
+    loCtx.fillRect(0, y, width, 1);
   }
 }
 
 function drawSky() {
-  ctx.save();
-  const grad = ctx.createLinearGradient(0, 0, 0, height);
-  grad.addColorStop(0, COLORS.skyTop);
-  grad.addColorStop(1, COLORS.skyBot);
-  ctx.fillStyle = grad;
-  ctx.fillRect(0, 0, width, height);
-
-  const sunX = width * 0.1;
-  const sunY = height * 0.12;
-  const sunGrad = ctx.createRadialGradient(sunX, sunY, 0, sunX, sunY, height * 0.25);
-  sunGrad.addColorStop(0, 'rgba(255, 255, 255, 0.72)');
-  sunGrad.addColorStop(0.35, 'rgba(255, 255, 255, 0.25)');
-  sunGrad.addColorStop(1, 'rgba(255, 255, 255, 0)');
-  ctx.fillStyle = sunGrad;
-  ctx.fillRect(0, 0, width, horizonY);
-  ctx.restore();
+  ditherFill(0, horizonY, PAL.skyTop, PAL.skyBot);
 }
 
 function drawSnowGround() {
-  ctx.save();
-  const snowGrad = ctx.createLinearGradient(0, horizonY, 0, height);
-  snowGrad.addColorStop(0, COLORS.snowTop);
-  snowGrad.addColorStop(1, COLORS.snowBot);
-  ctx.fillStyle = snowGrad;
-  ctx.fillRect(0, horizonY, width, height - horizonY);
+  ditherFill(horizonY, height, PAL.snowTop, PAL.snowBot);
 
-  const fogGrad = ctx.createLinearGradient(0, horizonY - height * 0.04, 0, horizonY + height * 0.2);
-  fogGrad.addColorStop(0, `rgba(255, 255, 255, ${COLORS.fogNear})`);
-  fogGrad.addColorStop(1, `rgba(255, 255, 255, ${COLORS.fogFar})`);
-  ctx.fillStyle = fogGrad;
-  ctx.fillRect(0, horizonY - height * 0.04, width, height * 0.24);
+  const fogY = Math.max(0, horizonY - Math.round(height * 0.08));
+  const fogH = Math.round(height * 0.22);
+  loCtx.fillStyle = PAL.fog;
+  loCtx.fillRect(0, fogY, width, fogH);
 
-  const spacing = 140;
+  const spacing = Math.max(12, Math.round(height * 0.18));
   const offset = (state.groundOffset % spacing + spacing) % spacing;
+  loCtx.save();
+  loCtx.globalAlpha = 0.35;
+  loCtx.strokeStyle = PAL.skyTop;
+  loCtx.lineWidth = 1;
   for (let y = horizonY + spacing - offset; y < height; y += spacing) {
-    const rel = clamp((y - horizonY) / (height - horizonY), 0, 1);
-    const alpha = 0.26 * (1 - rel) + 0.05;
-    ctx.strokeStyle = `rgba(255, 255, 255, ${alpha.toFixed(3)})`;
-    ctx.lineWidth = 1.1;
-    ctx.beginPath();
-    ctx.moveTo(0, y);
-    ctx.lineTo(width, y - spacing * 0.12);
-    ctx.stroke();
+    loCtx.beginPath();
+    loCtx.moveTo(0, y);
+    loCtx.lineTo(width, y - Math.round(spacing * 0.2));
+    loCtx.stroke();
   }
-
-  ctx.restore();
+  loCtx.restore();
 }
 
 function drawFlakes() {
-  ctx.save();
-  ctx.fillStyle = 'rgba(255, 255, 255, 0.9)';
+  loCtx.save();
   for (const flake of flakes) {
     const size = flake.size;
-    ctx.globalAlpha = clamp(0.35 + flake.depth * 0.65, 0.35, 1);
-    ctx.beginPath();
-    ctx.arc(flake.x, flake.y, size * 0.5, 0, Math.PI * 2);
-    ctx.fill();
+    loCtx.globalAlpha = clamp(0.4 + flake.depth * 0.4, 0.4, 0.85);
+    loCtx.fillStyle = PAL.skyTop;
+    const drawX = Math.round(flake.x);
+    const drawY = Math.round(flake.y);
+    loCtx.fillRect(drawX, drawY, size, size);
   }
-  ctx.restore();
+  loCtx.restore();
 }
 
 function drawHero() {
-  const scale = Number(window.__heroScale) || CAM.heroScaleBase;
-  const heroHeight = height * 0.2 * scale;
-  const heroX = width * 0.5;
-  const heroY = height * 0.68;
+  const scale = Number(window.__heroScale) || heroScale;
+  const heroHeight = Math.max(24, Math.round(height * 0.22 * scale));
+  const heroX = Math.round(width * CAM.targetXRatio + state.walk.sway * 0.4);
+  const heroY = Math.round(height * CAM.targetYRatio + state.walk.bob * 0.5);
 
-  ctx.save();
-  ctx.fillStyle = 'rgba(0, 0, 0, 0.2)';
-  ctx.beginPath();
-  ctx.ellipse(heroX, heroY + heroHeight * 0.45, heroHeight * 0.42, heroHeight * 0.18, 0, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.restore();
+  const shadowH = Math.max(2, Math.min(3, Math.round(heroHeight * 0.05)));
+  const shadowW = Math.round(heroHeight * 0.34);
+  loCtx.save();
+  loCtx.globalAlpha = 0.2;
+  loCtx.fillStyle = PAL.gun;
+  loCtx.beginPath();
+  loCtx.ellipse(heroX, heroY + Math.round(heroHeight * 0.42), shadowW, shadowH, 0, 0, Math.PI * 2);
+  loCtx.fill();
+  loCtx.restore();
 
   if (heroSpriteReady) {
     const aspect = heroImage.width / Math.max(1, heroImage.height);
     const drawHeight = heroHeight;
-    const drawWidth = drawHeight * aspect;
-    ctx.drawImage(heroImage, heroX - drawWidth / 2, heroY - drawHeight, drawWidth, drawHeight);
+    const drawWidth = Math.max(1, Math.round(drawHeight * aspect));
+    const drawX = Math.round(heroX - drawWidth / 2);
+    const drawY = Math.round(heroY - drawHeight);
+    loCtx.drawImage(heroImage, drawX, drawY, drawWidth, drawHeight);
     return;
   }
 
-  ctx.save();
-  ctx.translate(heroX, heroY - heroHeight);
+  loCtx.save();
+  loCtx.translate(heroX, heroY - heroHeight);
 
-  const torsoWidth = heroHeight * 0.36;
-  const torsoHeight = heroHeight * 0.58;
-  const packWidth = torsoWidth * 0.9;
-  const packHeight = torsoHeight * 0.8;
-  const headRadius = heroHeight * 0.16;
+  const torsoWidth = Math.round(heroHeight * 0.38);
+  const torsoHeight = Math.round(heroHeight * 0.6);
+  const packWidth = Math.round(torsoWidth * 0.9);
+  const packHeight = Math.round(torsoHeight * 0.82);
+  const headRadius = Math.max(2, Math.round(heroHeight * 0.16));
 
-  drawRoundedRect(ctx, -packWidth / 2, heroHeight * 0.12, packWidth, packHeight, packWidth * 0.22, '#23313f');
-  drawRoundedRect(ctx, -torsoWidth / 2, heroHeight * 0.18, torsoWidth, torsoHeight, torsoWidth * 0.28, '#2d3c4d');
+  drawRoundedRect(
+    loCtx,
+    -Math.round(packWidth / 2),
+    Math.round(heroHeight * 0.12),
+    packWidth,
+    packHeight,
+    Math.round(packWidth * 0.18),
+    PAL.navy2,
+  );
+  drawRoundedRect(
+    loCtx,
+    -Math.round(torsoWidth / 2),
+    Math.round(heroHeight * 0.18),
+    torsoWidth,
+    torsoHeight,
+    Math.round(torsoWidth * 0.22),
+    PAL.navy,
+  );
 
-  ctx.fillStyle = '#1e252f';
-  ctx.beginPath();
-  ctx.arc(0, headRadius + heroHeight * 0.02, headRadius, 0, Math.PI * 2);
-  ctx.fill();
+  loCtx.fillStyle = PAL.gun;
+  loCtx.beginPath();
+  loCtx.arc(0, headRadius + Math.round(heroHeight * 0.02), headRadius, 0, Math.PI * 2);
+  loCtx.fill();
 
-  ctx.strokeStyle = '#141920';
-  ctx.lineWidth = heroHeight * 0.03;
-  ctx.beginPath();
-  ctx.moveTo(torsoWidth * 0.4, heroHeight * 0.24);
-  ctx.lineTo(torsoWidth * 0.9, heroHeight * 0.9);
-  ctx.stroke();
+  loCtx.strokeStyle = PAL.gun;
+  loCtx.lineWidth = Math.max(1, Math.round(heroHeight * 0.03));
+  loCtx.beginPath();
+  loCtx.moveTo(Math.round(torsoWidth * 0.4), Math.round(heroHeight * 0.24));
+  loCtx.lineTo(Math.round(torsoWidth * 0.86), Math.round(heroHeight * 0.92));
+  loCtx.stroke();
 
-  ctx.fillStyle = '#3a4a5c';
-  drawRoundedRect(ctx, -torsoWidth * 0.55, heroHeight * 0.65, torsoWidth * 1.1, heroHeight * 0.18, torsoWidth * 0.18, '#3a4a5c');
+  drawRoundedRect(
+    loCtx,
+    -Math.round(torsoWidth * 0.55),
+    Math.round(heroHeight * 0.65),
+    Math.round(torsoWidth * 1.1),
+    Math.max(2, Math.round(heroHeight * 0.18)),
+    Math.round(torsoWidth * 0.16),
+    PAL.navy2,
+  );
 
-  ctx.restore();
+  loCtx.restore();
 }
 
 function drawRoundedRect(context, x, y, w, h, r, fillStyle) {
@@ -320,6 +365,9 @@ function tick(now) {
   const jitter = walkNoise * state.walk.jitterAmp;
   const speed = state.walk.base * (1 + jitter);
   state.groundOffset += speed * dt;
+  state.walk.phase += dt * speed * 0.045;
+  state.walk.bob = Math.sin(state.walk.phase * 2) * state.walk.bobAmp;
+  state.walk.sway = Math.sin(state.walk.phase + Math.PI / 2) * state.walk.swayAmp;
 
   const speedNorm = clamp((speed - state.walk.base) / state.walk.base, 0, 1);
   const stepInterval = clamp(0.48 - speedNorm * 0.2, 0.3, 0.55);
@@ -333,15 +381,19 @@ function tick(now) {
   state.fps += (fpsInstant - state.fps) * state.fpsFilter;
   updateHud();
 
-  const wind = Math.sin(state.walk.noiseT * 1.3) * 22;
+  const wind = Math.sin(state.walk.noiseT * 1.3) * 6 + state.walk.sway * 0.4;
   updateFlakes(dt, wind);
 
-  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-  ctx.clearRect(0, 0, width, height);
+  loCtx.setTransform(1, 0, 0, 1, 0, 0);
+  loCtx.clearRect(0, 0, width, height);
   drawSky();
   drawSnowGround();
   drawHero();
   drawFlakes();
+
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  ctx.drawImage(lo, 0, 0, canvas.width, canvas.height);
 }
 
 updateAudioButton();
