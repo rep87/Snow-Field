@@ -54,8 +54,18 @@ main {
   position: absolute;
   top: 1rem;
   right: 1rem;
-  min-width: 200px;
-  min-height: 80px;
   pointer-events: none;
-  opacity: 0;
+  font-family: ui-monospace, SFMono-Regular, "IBM Plex Mono", Menlo, Monaco, Consolas,
+    "Liberation Mono", "Courier New", monospace;
+  font-size: 0.75rem;
+  line-height: 1.4;
+  white-space: pre;
+  text-align: right;
+  color: rgba(27, 42, 58, 0.78);
+  background: rgba(255, 255, 255, 0.18);
+  padding: 0.35rem 0.6rem;
+  border-radius: 0.5rem;
+  box-shadow: 0 0.4rem 1.4rem rgba(17, 31, 48, 0.08);
+  backdrop-filter: blur(6px);
+  opacity: 0.92;
 }

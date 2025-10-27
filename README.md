@@ -2,6 +2,8 @@
 
 Minimal canvas-driven snow field prototype with deterministic world time pausing during zoom.
 
+Live demo: https://rep87.github.io//Snow-Field/
+
 ## Run locally
 
 Use any static file server and open the site in a browser:
