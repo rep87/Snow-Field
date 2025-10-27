@@ -4,12 +4,53 @@ import AudioMix from './lib/audio.js';
 const canvas = document.getElementById('scene');
 const ctx = canvas.getContext('2d');
 
+const SETTINGS_KEY = 'snow-field-settings';
+const defaultSettings = { muted: true, quality: 'high' };
+let settings = { ...defaultSettings };
+
+const soundToggle = document.getElementById('sound-toggle');
+const qualityToggle = document.getElementById('quality-toggle');
+const infoButton = document.getElementById('info-button');
+const infoOverlay = document.getElementById('info-overlay');
+const infoCloseButton = infoOverlay ? infoOverlay.querySelector('[data-close]') : null;
+const captionBar = document.getElementById('caption-bar');
+
+const CAPTION_TEXT = {
+  wind: '[바람이 설원을 스친다]',
+  blizzard: '[눈보라가 시야를 뒤덮는다]',
+  wolf: '[먼 곳에서 늑대가 울부짖는다]',
+  reindeer: '[순록이 눈발을 가르며 달린다]',
+  fire: '[장작불이 포근한 온기를 전한다]',
+  zoom_short: '[숨을 깊게 들이쉰다]',
+  zoom_soft: '[따뜻한 숨결이 공기 속으로 번진다]',
+};
+
+let qualityLevel = 'high';
+let subtitlesEnabled = false;
+let captionTimeoutId = null;
+let lastFocusBeforeInfo = null;
+
+const reduceMotionQuery = typeof window !== 'undefined' && typeof window.matchMedia === 'function'
+  ? window.matchMedia('(prefers-reduced-motion: reduce)')
+  : null;
+let prefersReducedMotion = reduceMotionQuery ? reduceMotionQuery.matches : false;
+
+const cameraShake = { x: 0, y: 0 };
+
+const QUALITY_SNOW_FACTOR = { high: 1, low: 0.7 };
+const REDUCED_MOTION_SNOW_FACTOR = 0.6;
+
 const worldCanvas = document.createElement('canvas');
 const worldCtx = worldCanvas.getContext('2d');
 const maskCanvas = document.createElement('canvas');
 const maskCtx = maskCanvas.getContext('2d');
 
-let dpr = window.devicePixelRatio || 1;
+function getEffectivePixelRatio() {
+  const base = window.devicePixelRatio || 1;
+  return qualityLevel === 'low' ? Math.min(1, base) : base;
+}
+
+let dpr = getEffectivePixelRatio();
 let viewWidth = 0;
 let viewHeight = 0;
 
@@ -90,8 +131,206 @@ let eventDirector = null;
 let lastFrameRealTime = performance.now() / 1000;
 let latestRealTime = lastFrameRealTime;
 
+function loadSettings() {
+  if (typeof localStorage === 'undefined') {
+    return;
+  }
+  try {
+    const stored = localStorage.getItem(SETTINGS_KEY);
+    if (!stored) {
+      return;
+    }
+    const parsed = JSON.parse(stored);
+    if (parsed && typeof parsed === 'object') {
+      if (typeof parsed.muted === 'boolean') {
+        settings.muted = parsed.muted;
+      }
+      if (parsed.quality === 'low' || parsed.quality === 'high') {
+        settings.quality = parsed.quality;
+      }
+    }
+  } catch (error) {
+    // Ignore malformed storage content
+  }
+}
+
+function saveSettings() {
+  if (typeof localStorage === 'undefined') {
+    return;
+  }
+  try {
+    const payload = JSON.stringify({
+      muted: settings.muted,
+      quality: settings.quality,
+    });
+    localStorage.setItem(SETTINGS_KEY, payload);
+  } catch (error) {
+    // Storage may be unavailable (private mode, etc.)
+  }
+}
+
+function updateSoundButton() {
+  if (!soundToggle) {
+    return;
+  }
+  const mutedState = AudioMix.isMuted();
+  soundToggle.setAttribute('aria-pressed', String(!mutedState));
+  soundToggle.setAttribute('aria-label', mutedState ? 'Unmute sound' : 'Mute sound');
+  const icon = soundToggle.querySelector('.hud-icon');
+  if (icon) {
+    icon.textContent = mutedState ? '🔇' : '🔊';
+  }
+}
+
+function setMutedState(value, { persist = true } = {}) {
+  const nextMuted = Boolean(value);
+  settings.muted = nextMuted;
+  AudioMix.setMuted(nextMuted);
+  updateSoundButton();
+  if (!nextMuted && AudioMix.playWind) {
+    AudioMix.playWind();
+  }
+  if (persist) {
+    saveSettings();
+  }
+}
+
+function updateQualityButton() {
+  if (!qualityToggle) {
+    return;
+  }
+  const isHigh = qualityLevel === 'high';
+  qualityToggle.setAttribute('aria-pressed', String(isHigh));
+  qualityToggle.setAttribute(
+    'aria-label',
+    isHigh ? 'Switch to lower quality visuals' : 'Switch to higher quality visuals',
+  );
+  const icon = qualityToggle.querySelector('.hud-icon');
+  if (icon) {
+    icon.textContent = isHigh ? 'HQ' : 'LQ';
+  }
+}
+
+function setQuality(level, { persist = true, resize = true } = {}) {
+  qualityLevel = level === 'low' ? 'low' : 'high';
+  settings.quality = qualityLevel;
+  updateQualityButton();
+  if (resize) {
+    resizeCanvas();
+  }
+  if (persist) {
+    saveSettings();
+  }
+}
+
+function updateInfoButton(isOpen) {
+  if (infoButton) {
+    infoButton.setAttribute('aria-expanded', String(Boolean(isOpen)));
+  }
+}
+
+function hideCaption() {
+  if (!captionBar) {
+    return;
+  }
+  captionBar.removeAttribute('data-visible');
+  captionBar.textContent = '';
+  captionTimeoutId = null;
+}
+
+function showCaption(text, duration = 3200, { force = false } = {}) {
+  if (!captionBar) {
+    return;
+  }
+  if (!subtitlesEnabled && !force) {
+    return;
+  }
+  captionBar.textContent = text;
+  captionBar.setAttribute('data-visible', 'true');
+  clearTimeout(captionTimeoutId);
+  captionTimeoutId = window.setTimeout(() => {
+    hideCaption();
+  }, duration);
+}
+
+function queueCaption(key, options = {}) {
+  const text = CAPTION_TEXT[key];
+  if (!text) {
+    return;
+  }
+  showCaption(text, options.duration || 3200, { force: Boolean(options.force) });
+}
+
+function toggleSubtitles() {
+  subtitlesEnabled = !subtitlesEnabled;
+  const message = subtitlesEnabled ? '[자막 켜짐]' : '[자막 꺼짐]';
+  showCaption(message, 1800, { force: true });
+}
+
+function openInfoOverlay() {
+  if (!infoOverlay || !infoOverlay.hidden) {
+    return;
+  }
+  infoOverlay.hidden = false;
+  updateInfoButton(true);
+  lastFocusBeforeInfo = document.activeElement;
+  const focusTarget = infoCloseButton || infoOverlay;
+  window.requestAnimationFrame(() => {
+    if (focusTarget && typeof focusTarget.focus === 'function') {
+      focusTarget.focus();
+    }
+  });
+}
+
+function closeInfoOverlay() {
+  if (!infoOverlay || infoOverlay.hidden) {
+    return;
+  }
+  infoOverlay.hidden = true;
+  updateInfoButton(false);
+  const target = lastFocusBeforeInfo && typeof lastFocusBeforeInfo.focus === 'function'
+    ? lastFocusBeforeInfo
+    : infoButton;
+  if (target && typeof target.focus === 'function') {
+    target.focus();
+  }
+}
+
+function toggleInfoOverlay(forceState) {
+  const shouldOpen = typeof forceState === 'boolean' ? forceState : infoOverlay?.hidden;
+  if (shouldOpen) {
+    openInfoOverlay();
+  } else {
+    closeInfoOverlay();
+  }
+}
+
+function getSnowMotionFactor() {
+  return prefersReducedMotion ? REDUCED_MOTION_SNOW_FACTOR : 1;
+}
+
+function getQualitySnowFactor() {
+  return QUALITY_SNOW_FACTOR[qualityLevel] ?? 1;
+}
+
+function handleMotionPreferenceChange(event) {
+  prefersReducedMotion = Boolean(event.matches);
+  cameraShake.x = 0;
+  cameraShake.y = 0;
+  adjustSnowflakes();
+}
+
+if (reduceMotionQuery) {
+  const motionListener = (event) => handleMotionPreferenceChange(event);
+  if (typeof reduceMotionQuery.addEventListener === 'function') {
+    reduceMotionQuery.addEventListener('change', motionListener);
+  } else if (typeof reduceMotionQuery.addListener === 'function') {
+    reduceMotionQuery.addListener(motionListener);
+  }
+}
+
 function resizeCanvas() {
-  dpr = window.devicePixelRatio || 1;
+  dpr = getEffectivePixelRatio();
   const width = window.innerWidth;
   const height = window.innerHeight;
   viewWidth = width;
@@ -287,6 +526,7 @@ function updateBreath(realTime, delta) {
     lastBreathPuffRealTime = -Infinity;
     if (breathState === 'phase1') {
       AudioMix.playZoomBreathShort();
+      queueCaption('zoom_short', { duration: 2400 });
     }
   }
 
@@ -302,6 +542,7 @@ function updateBreath(realTime, delta) {
       spawnBreathPuff(0.5);
       lastBreathPuffRealTime = realTime;
       AudioMix.playZoomBreathSoft({ gain: 0.25 });
+      queueCaption('zoom_soft', { duration: 3200 });
     }
   }
 }
@@ -438,6 +679,19 @@ function updateWindState(delta) {
   windState.amplitude = lerp(windState.amplitude, windState.targetAmplitude, smoothing);
 }
 
+function updateCameraShake(realTime) {
+  if (prefersReducedMotion) {
+    cameraShake.x = 0;
+    cameraShake.y = 0;
+    return;
+  }
+  const intensity = clamp(windState.amplitude / windState.blizzardAmplitude, 0, 1);
+  const qualityModifier = qualityLevel === 'low' ? 0.7 : 1;
+  const amplitude = 2.6 * intensity * qualityModifier;
+  cameraShake.x = Math.sin(realTime * 0.9) * amplitude;
+  cameraShake.y = Math.cos(realTime * 1.2) * amplitude * 0.6;
+}
+
 function setWindTargetAmplitude(value) {
   windState.targetAmplitude = value;
 }
@@ -462,6 +716,7 @@ function startBlizzard() {
   if (AudioMix.playBlizzard) {
     AudioMix.playBlizzard();
   }
+  queueCaption('blizzard');
 }
 
 function endBlizzard() {
@@ -474,6 +729,7 @@ function endBlizzard() {
   if (AudioMix.playWind) {
     AudioMix.playWind();
   }
+  queueCaption('wind');
 }
 
 function startWolfEncounter(currentJourneyTime) {
@@ -487,6 +743,7 @@ function startWolfEncounter(currentJourneyTime) {
   if (AudioMix.playWolfDistant) {
     AudioMix.playWolfDistant();
   }
+  queueCaption('wolf');
 }
 
 function beginWolfWithdraw(boosted) {
@@ -512,6 +769,7 @@ function startReindeerPass() {
   } else if (AudioMix.playReindeer) {
     AudioMix.playReindeer();
   }
+  queueCaption('reindeer');
 }
 
 function endReindeerPass() {
@@ -617,7 +875,12 @@ class EventDirector {
 
 function getTargetSnowflakeCount() {
   const areaFactor = (viewWidth * viewHeight) / (1280 * 720);
-  return Math.max(80, Math.floor(BASE_SNOW_COUNT * snowDensityMultiplier * areaFactor));
+  const motionFactor = getSnowMotionFactor();
+  const qualityFactor = getQualitySnowFactor();
+  return Math.max(
+    80,
+    Math.floor(BASE_SNOW_COUNT * snowDensityMultiplier * areaFactor * motionFactor * qualityFactor),
+  );
 }
 
 function spawnSnowflake(atTop = false) {
@@ -932,6 +1195,7 @@ function triggerEnding() {
   if (AudioMix.playIndoorFire) {
     AudioMix.playIndoorFire({ loop: true });
   }
+  queueCaption('fire');
   showReplayButton();
 }
 
@@ -1104,6 +1368,9 @@ function render(timestamp) {
   drawWorld(palette);
 
   ctx.clearRect(0, 0, viewWidth, viewHeight);
+  updateCameraShake(realTime);
+  ctx.save();
+  ctx.translate(cameraShake.x, cameraShake.y);
   ctx.drawImage(worldCanvas, 0, 0, canvas.width, canvas.height, 0, 0, viewWidth, viewHeight);
 
   if (palette.period === 'night') {
@@ -1113,6 +1380,7 @@ function render(timestamp) {
   if (endingState.active) {
     drawEndingOverlay();
   }
+  ctx.restore();
 
   window.requestAnimationFrame(render);
 }
@@ -1152,6 +1420,11 @@ function init() {
     return;
   }
 
+  loadSettings();
+  setQuality(settings.quality, { persist: false, resize: false });
+  setMutedState(settings.muted, { persist: false });
+  updateInfoButton(false);
+
   resizeCanvas();
   window.addEventListener('resize', resizeCanvas);
 
@@ -1174,8 +1447,47 @@ function init() {
   window.addEventListener('keydown', (event) => {
     if (event.key === 'Enter' && endingState.active) {
       resetExperience();
+    } else if (event.key === 'c' || event.key === 'C') {
+      toggleSubtitles();
+    } else if (event.key === 'i' || event.key === 'I') {
+      toggleInfoOverlay();
+    } else if (event.key === 'Escape') {
+      closeInfoOverlay();
     }
   });
+
+  if (soundToggle) {
+    soundToggle.addEventListener('click', () => {
+      setMutedState(!AudioMix.isMuted());
+    });
+  }
+
+  if (qualityToggle) {
+    qualityToggle.addEventListener('click', () => {
+      const nextQuality = qualityLevel === 'high' ? 'low' : 'high';
+      setQuality(nextQuality);
+    });
+  }
+
+  if (infoButton) {
+    infoButton.addEventListener('click', () => {
+      toggleInfoOverlay();
+    });
+  }
+
+  if (infoCloseButton) {
+    infoCloseButton.addEventListener('click', () => {
+      closeInfoOverlay();
+    });
+  }
+
+  if (infoOverlay) {
+    infoOverlay.addEventListener('click', (event) => {
+      if (event.target === infoOverlay) {
+        closeInfoOverlay();
+      }
+    });
+  }
 
   AudioMix.loadAll().catch(() => undefined);
 
