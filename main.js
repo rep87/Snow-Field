@@ -16,6 +16,42 @@ let viewHeight = 0;
 let worldTime = 0;
 const WORLD_TIME_CYCLE = 120; // seconds per full day cycle
 
+let journeyTime = 0;
+let groundScrollDistance = 0;
+
+const JOURNEY_BASE_SPEED = 24; // abstract units per second
+const JOURNEY_TARGET_RANGE = { min: 600, max: 720 }; // seconds
+const BLIZZARD_DURATION = 30;
+const BLIZZARD_SPEED_MULTIPLIER = 0.8;
+
+let journeyTargetDuration = 660;
+let targetDistance = JOURNEY_BASE_SPEED * journeyTargetDuration;
+
+const snowflakes = [];
+const BASE_SNOW_COUNT = 240;
+let snowDensityMultiplier = 1;
+
+const windState = {
+  amplitude: 18,
+  targetAmplitude: 18,
+  baseAmplitude: 18,
+  boostedAmplitude: 32,
+  blizzardAmplitude: 42,
+  gustTimer: 0,
+  blizzard: false,
+};
+
+let walkSpeedMultiplier = 1;
+let experienceMode = 'journey';
+
+const endingState = {
+  active: false,
+  progress: 0,
+  indoorSteam: 0,
+};
+
+let replayButton = null;
+
 const hero = { x: 0, y: 0, radius: 22 };
 const mouse = { x: 0, y: 0, active: false };
 let currentAim = { x: 1, y: 0 };
@@ -26,6 +62,30 @@ let breathState = 'idle';
 let lastBreathState = 'idle';
 let lastBreathPuffRealTime = -Infinity;
 const breathPuffs = [];
+
+const wolfState = {
+  active: false,
+  withdraw: false,
+  calm: false,
+  focusTime: 0,
+  spawnJourneyTime: 0,
+  withdrawJourneyTime: 0,
+  growlBoosted: false,
+};
+
+const reindeerState = {
+  active: false,
+  progress: 0,
+  speed: 0.12,
+};
+
+const hutState = {
+  visible: false,
+  revealJourneyDistance: 0,
+  progress: 0,
+};
+
+let eventDirector = null;
 
 let lastFrameRealTime = performance.now() / 1000;
 let latestRealTime = lastFrameRealTime;
@@ -51,6 +111,7 @@ function resizeCanvas() {
   maskCanvas.height = canvas.height;
 
   updateHeroPosition();
+  adjustSnowflakes();
 }
 
 function updateHeroPosition() {
@@ -84,6 +145,22 @@ function lerpColor(hexA, hexB, t) {
     g: lerp(rgbA.g, rgbB.g, t),
     b: lerp(rgbA.b, rgbB.b, t),
   });
+}
+
+function randomRange(min, max) {
+  return min + Math.random() * (max - min);
+}
+
+function jitterTime(baseSeconds) {
+  const variance = baseSeconds * 0.15;
+  return baseSeconds + (Math.random() * 2 - 1) * variance;
+}
+
+function resetJourneyTargets() {
+  journeyTargetDuration = randomRange(JOURNEY_TARGET_RANGE.min, JOURNEY_TARGET_RANGE.max);
+  const baseTravel = JOURNEY_BASE_SPEED * Math.max(0, journeyTargetDuration - BLIZZARD_DURATION);
+  const blizzardTravel = JOURNEY_BASE_SPEED * BLIZZARD_SPEED_MULTIPLIER * BLIZZARD_DURATION;
+  targetDistance = baseTravel + blizzardTravel;
 }
 
 const PAL_DAY = {
@@ -259,6 +336,11 @@ function drawWorld(palette) {
   worldCtx.fillStyle = groundGradient;
   worldCtx.fillRect(0, horizonY, viewWidth, viewHeight - horizonY);
 
+  drawDistantRidges(worldCtx, palette);
+  drawHut(worldCtx);
+  drawReindeer(worldCtx);
+  drawWolf(worldCtx);
+
   const celestialX = viewWidth * 0.2;
   const celestialY = viewHeight * 0.25;
   const celestialRadius = 120;
@@ -305,6 +387,12 @@ function drawWorld(palette) {
   worldCtx.stroke();
 
   drawBreath(worldCtx);
+  drawSnowflakes(worldCtx);
+
+  if (windState.blizzard) {
+    worldCtx.fillStyle = 'rgba(180, 200, 220, 0.25)';
+    worldCtx.fillRect(0, 0, viewWidth, viewHeight);
+  }
 }
 
 function clamp(value, min, max) {
@@ -345,6 +433,638 @@ function applyNightLighting(isZoomed) {
   ctx.restore();
 }
 
+function updateWindState(delta) {
+  const smoothing = 1 - Math.exp(-delta * 3.2);
+  windState.amplitude = lerp(windState.amplitude, windState.targetAmplitude, smoothing);
+}
+
+function setWindTargetAmplitude(value) {
+  windState.targetAmplitude = value;
+}
+
+function startWindBurst() {
+  windState.gustTimer = 20;
+  setWindTargetAmplitude(windState.boostedAmplitude);
+}
+
+function endWindBurst() {
+  windState.gustTimer = 0;
+  if (!windState.blizzard) {
+    setWindTargetAmplitude(windState.baseAmplitude);
+  }
+}
+
+function startBlizzard() {
+  windState.blizzard = true;
+  setWindTargetAmplitude(windState.blizzardAmplitude);
+  snowDensityMultiplier = 1.6;
+  walkSpeedMultiplier = BLIZZARD_SPEED_MULTIPLIER;
+  if (AudioMix.playBlizzard) {
+    AudioMix.playBlizzard();
+  }
+}
+
+function endBlizzard() {
+  windState.blizzard = false;
+  snowDensityMultiplier = 1;
+  walkSpeedMultiplier = 1;
+  if (windState.gustTimer <= 0) {
+    setWindTargetAmplitude(windState.baseAmplitude);
+  }
+  if (AudioMix.playWind) {
+    AudioMix.playWind();
+  }
+}
+
+function startWolfEncounter(currentJourneyTime) {
+  wolfState.active = true;
+  wolfState.withdraw = false;
+  wolfState.calm = false;
+  wolfState.focusTime = 0;
+  wolfState.spawnJourneyTime = currentJourneyTime;
+  wolfState.withdrawJourneyTime = 0;
+  wolfState.growlBoosted = false;
+  if (AudioMix.playWolfDistant) {
+    AudioMix.playWolfDistant();
+  }
+}
+
+function beginWolfWithdraw(boosted) {
+  if (!wolfState.active || wolfState.withdraw) {
+    return;
+  }
+  wolfState.withdraw = true;
+  wolfState.growlBoosted = Boolean(boosted);
+  wolfState.withdrawJourneyTime = 0;
+}
+
+function endWolfEncounter() {
+  wolfState.active = false;
+  wolfState.withdraw = false;
+}
+
+function startReindeerPass() {
+  reindeerState.active = true;
+  reindeerState.progress = -0.25;
+  reindeerState.speed = 0.16 + Math.random() * 0.04;
+  if (AudioMix.playReindeerPass) {
+    AudioMix.playReindeerPass();
+  } else if (AudioMix.playReindeer) {
+    AudioMix.playReindeer();
+  }
+}
+
+function endReindeerPass() {
+  reindeerState.active = false;
+  reindeerState.progress = 0;
+}
+
+function startHutReveal() {
+  hutState.visible = true;
+  hutState.revealJourneyDistance = groundScrollDistance;
+  hutState.progress = 0;
+}
+
+function resetHut() {
+  hutState.visible = false;
+  hutState.revealJourneyDistance = 0;
+  hutState.progress = 0;
+}
+
+class EventDirector {
+  constructor() {
+    this.events = [];
+    this.reset();
+  }
+
+  reset() {
+    this.events = [
+      {
+        key: 'windBurst',
+        time: jitterTime(90),
+        duration: 20,
+        started: false,
+        completed: false,
+        onStart: startWindBurst,
+        onEnd: endWindBurst,
+      },
+      {
+        key: 'wolf',
+        time: jitterTime(210),
+        started: false,
+        completed: false,
+        onStart: (t) => startWolfEncounter(t),
+      },
+      {
+        key: 'blizzard',
+        time: jitterTime(330),
+        duration: 30,
+        started: false,
+        completed: false,
+        onStart: startBlizzard,
+        onEnd: endBlizzard,
+      },
+      {
+        key: 'reindeer',
+        time: jitterTime(450),
+        started: false,
+        completed: false,
+        onStart: startReindeerPass,
+      },
+      {
+        key: 'hut',
+        time: jitterTime(540),
+        started: false,
+        completed: false,
+        onStart: startHutReveal,
+      },
+    ];
+  }
+
+  update(currentJourneyTime, delta) {
+    this.events.forEach((event) => {
+      if (event.completed) {
+        return;
+      }
+      if (!event.started && currentJourneyTime >= event.time) {
+        event.started = true;
+        if (event.onStart) {
+          event.onStart(currentJourneyTime);
+        }
+      }
+      if (event.started && event.duration) {
+        if (!event.endTime) {
+          event.endTime = event.time + event.duration;
+        }
+        if (currentJourneyTime >= event.endTime) {
+          event.completed = true;
+          if (event.onEnd) {
+            event.onEnd();
+          }
+        }
+      }
+      if (event.started && !event.duration && event.key === 'reindeer') {
+        if (!reindeerState.active) {
+          event.completed = true;
+        }
+      }
+      if (event.started && !event.duration && event.key === 'hut' && hutState.visible) {
+        event.completed = true;
+      }
+    });
+  }
+}
+
+function getTargetSnowflakeCount() {
+  const areaFactor = (viewWidth * viewHeight) / (1280 * 720);
+  return Math.max(80, Math.floor(BASE_SNOW_COUNT * snowDensityMultiplier * areaFactor));
+}
+
+function spawnSnowflake(atTop = false) {
+  const radius = randomRange(1, 3.8);
+  const speed = 34 + radius * 16 + Math.random() * 14;
+  const seed = Math.random() * 1000;
+  const x = Math.random() * viewWidth;
+  const y = atTop ? -Math.random() * viewHeight * 0.1 : Math.random() * viewHeight;
+  snowflakes.push({ x, y, radius, speed, seed });
+}
+
+function adjustSnowflakes() {
+  const targetCount = getTargetSnowflakeCount();
+  while (snowflakes.length < targetCount) {
+    spawnSnowflake(true);
+  }
+  while (snowflakes.length > targetCount) {
+    snowflakes.pop();
+  }
+}
+
+function updateSnowflakes(delta, realTime) {
+  adjustSnowflakes();
+  const windAmplitude = windState.amplitude;
+  const noiseScale = 0.0025;
+  for (let i = snowflakes.length - 1; i >= 0; i -= 1) {
+    const flake = snowflakes[i];
+    const wind = perlin2((flake.seed + realTime * 0.08) * 0.3, (flake.y + groundScrollDistance) * noiseScale);
+    const drift = wind * windAmplitude;
+    flake.x += drift * delta;
+    flake.y += flake.speed * delta;
+
+    if (flake.x < -40) {
+      flake.x = viewWidth + 20;
+    } else if (flake.x > viewWidth + 40) {
+      flake.x = -20;
+    }
+    if (flake.y > viewHeight + 40) {
+      flake.y = -randomRange(20, viewHeight * 0.2);
+      flake.x = Math.random() * viewWidth;
+    }
+  }
+}
+
+function drawSnowflakes(targetCtx) {
+  targetCtx.save();
+  targetCtx.fillStyle = 'rgba(255, 255, 255, 0.82)';
+  snowflakes.forEach((flake) => {
+    targetCtx.beginPath();
+    targetCtx.arc(flake.x, flake.y, flake.radius, 0, Math.PI * 2);
+    targetCtx.fill();
+  });
+  targetCtx.restore();
+}
+
+function drawDistantRidges(targetCtx, palette) {
+  const ridgeCount = 3;
+  for (let i = 0; i < ridgeCount; i += 1) {
+    const layer = i + 1;
+    const layerDepth = layer / ridgeCount;
+    const yBase = viewHeight * (0.45 + layer * 0.06);
+    const color = lerpColor(palette.horizon, palette.ground, layerDepth * 0.6);
+    targetCtx.fillStyle = color;
+    targetCtx.beginPath();
+    targetCtx.moveTo(0, viewHeight);
+    const peakCount = 5 + layer;
+    const scale = 0.004 + layer * 0.0025;
+    const amplitude = 40 + layer * 20;
+    const offset = groundScrollDistance * 0.02 * (1 - layerDepth);
+    for (let x = -60; x <= viewWidth + 60; x += viewWidth / peakCount) {
+      const noiseValue = perlin2((x + offset) * scale, layer * 17.31);
+      const peakHeight = yBase + noiseValue * amplitude;
+      targetCtx.lineTo(x, peakHeight);
+    }
+    targetCtx.lineTo(viewWidth, viewHeight);
+    targetCtx.closePath();
+    targetCtx.fill();
+  }
+}
+
+function getWolfScreenPosition() {
+  return {
+    x: viewWidth * 0.8,
+    y: viewHeight * 0.46,
+  };
+}
+
+function updateWolfState(delta) {
+  if (!wolfState.active) {
+    return;
+  }
+
+  const wolfPos = getWolfScreenPosition();
+  const toWolf = { x: wolfPos.x - hero.x, y: wolfPos.y - hero.y };
+  const distance = Math.hypot(toWolf.x, toWolf.y) || 1;
+  const dir = { x: toWolf.x / distance, y: toWolf.y / distance };
+  const dot = currentAim.x * dir.x + currentAim.y * dir.y;
+  const alignmentThreshold = Math.cos((Math.PI / 180) * 6);
+  if (zooming && dot >= alignmentThreshold) {
+    wolfState.focusTime += delta;
+  } else {
+    wolfState.focusTime = Math.max(0, wolfState.focusTime - delta * 0.5);
+  }
+
+  if (!wolfState.calm && wolfState.focusTime >= 2.2) {
+    wolfState.calm = true;
+    beginWolfWithdraw(false);
+  }
+
+  const timeSinceSpawn = journeyTime - wolfState.spawnJourneyTime;
+  if (!wolfState.withdraw && timeSinceSpawn >= 5) {
+    beginWolfWithdraw(true);
+  }
+
+  if (wolfState.withdraw) {
+    wolfState.withdrawJourneyTime += delta;
+    if (wolfState.withdrawJourneyTime >= 3.2) {
+      endWolfEncounter();
+    }
+  }
+}
+
+function drawWolf(targetCtx) {
+  if (!wolfState.active) {
+    return;
+  }
+  const wolfPos = getWolfScreenPosition();
+  let offsetX = 0;
+  if (wolfState.withdraw) {
+    const progress = clamp(wolfState.withdrawJourneyTime / 2.2, 0, 1);
+    offsetX = progress * viewWidth * 0.25;
+  }
+  const x = wolfPos.x + offsetX;
+  const y = wolfPos.y;
+  targetCtx.save();
+  targetCtx.fillStyle = '#2a3137';
+  targetCtx.beginPath();
+  targetCtx.ellipse(x, y + 12, 46, 24, 0, 0, Math.PI * 2);
+  targetCtx.fill();
+
+  targetCtx.fillStyle = '#1b1f23';
+  targetCtx.beginPath();
+  targetCtx.moveTo(x - 30, y + 10);
+  targetCtx.lineTo(x - 12, y - 26);
+  targetCtx.lineTo(x + 18, y - 22);
+  targetCtx.lineTo(x + 34, y + 6);
+  targetCtx.closePath();
+  targetCtx.fill();
+
+  targetCtx.fillStyle = '#f2f4f7';
+  targetCtx.beginPath();
+  targetCtx.arc(x + 14, y - 6, 4, 0, Math.PI * 2);
+  targetCtx.fill();
+
+  targetCtx.fillStyle = wolfState.calm ? 'rgba(196, 230, 255, 0.5)' : 'rgba(255, 196, 140, 0.6)';
+  const auraRadius = wolfState.calm ? 30 : 40;
+  targetCtx.beginPath();
+  targetCtx.arc(x, y, auraRadius, 0, Math.PI * 2);
+  targetCtx.fill();
+
+  if (wolfState.withdraw && wolfState.growlBoosted) {
+    targetCtx.fillStyle = 'rgba(255, 120, 120, 0.9)';
+    targetCtx.font = '20px "Noto Sans KR", sans-serif';
+    targetCtx.textAlign = 'center';
+    targetCtx.fillText('그르르…', x, y - 52);
+  } else if (wolfState.withdraw && wolfState.calm) {
+    targetCtx.fillStyle = 'rgba(180, 220, 255, 0.85)';
+    targetCtx.font = '18px "Noto Sans KR", sans-serif';
+    targetCtx.textAlign = 'center';
+    targetCtx.fillText('시선을 피했다.', x, y - 48);
+  }
+  targetCtx.restore();
+}
+
+function updateReindeer(delta) {
+  if (!reindeerState.active) {
+    return;
+  }
+  reindeerState.progress += delta * reindeerState.speed;
+  if (reindeerState.progress >= 1.4) {
+    endReindeerPass();
+  }
+}
+
+function drawReindeer(targetCtx) {
+  if (!reindeerState.active) {
+    return;
+  }
+  const progress = reindeerState.progress;
+  const x = viewWidth * (0.1 + progress * 0.9);
+  const yBase = viewHeight * 0.5;
+  const bob = Math.sin(progress * Math.PI * 2) * 10;
+  targetCtx.save();
+  targetCtx.translate(x, yBase + bob);
+  targetCtx.fillStyle = 'rgba(120, 82, 60, 0.9)';
+  targetCtx.beginPath();
+  targetCtx.ellipse(0, 0, 34, 16, 0, 0, Math.PI * 2);
+  targetCtx.fill();
+  targetCtx.fillStyle = 'rgba(90, 62, 44, 0.9)';
+  targetCtx.fillRect(-12, -24, 6, 28);
+  targetCtx.fillRect(6, -24, 6, 28);
+  targetCtx.strokeStyle = 'rgba(220, 210, 200, 0.9)';
+  targetCtx.lineWidth = 2;
+  targetCtx.beginPath();
+  targetCtx.moveTo(-6, -24);
+  targetCtx.bezierCurveTo(-14, -38, -30, -44, -34, -56);
+  targetCtx.stroke();
+  targetCtx.beginPath();
+  targetCtx.moveTo(10, -22);
+  targetCtx.bezierCurveTo(20, -32, 28, -40, 34, -52);
+  targetCtx.stroke();
+  targetCtx.restore();
+}
+
+function updateHutProgress() {
+  if (!hutState.visible) {
+    return;
+  }
+  const span = Math.max(40, targetDistance - hutState.revealJourneyDistance);
+  const traveled = clamp(groundScrollDistance - hutState.revealJourneyDistance, 0, span);
+  hutState.progress = traveled / span;
+}
+
+function drawHut(targetCtx) {
+  if (!hutState.visible) {
+    return;
+  }
+  const progress = hutState.progress;
+  const baseScale = 0.35 + progress * 0.65;
+  const x = viewWidth * 0.5;
+  const y = viewHeight * (0.62 - progress * 0.14);
+  const width = 180 * baseScale;
+  const height = 140 * baseScale;
+  targetCtx.save();
+  targetCtx.translate(x, y);
+  targetCtx.fillStyle = 'rgba(150, 110, 80, 0.92)';
+  targetCtx.fillRect(-width * 0.5, -height, width, height);
+  targetCtx.fillStyle = 'rgba(120, 88, 60, 0.92)';
+  targetCtx.beginPath();
+  targetCtx.moveTo(-width * 0.6, -height);
+  targetCtx.lineTo(0, -height - height * 0.6);
+  targetCtx.lineTo(width * 0.6, -height);
+  targetCtx.closePath();
+  targetCtx.fill();
+
+  targetCtx.fillStyle = 'rgba(240, 210, 160, 0.9)';
+  targetCtx.fillRect(-width * 0.15, -height * 0.6, width * 0.3, height * 0.4);
+
+  targetCtx.fillStyle = 'rgba(255, 240, 210, 0.6)';
+  targetCtx.beginPath();
+  targetCtx.arc(0, -height * 0.6, width * 0.12, 0, Math.PI * 2);
+  targetCtx.fill();
+  targetCtx.restore();
+}
+
+function ensureReplayButton() {
+  if (replayButton) {
+    return;
+  }
+  replayButton = document.createElement('button');
+  replayButton.type = 'button';
+  replayButton.textContent = 'Replay';
+  replayButton.style.position = 'absolute';
+  replayButton.style.left = '50%';
+  replayButton.style.top = '70%';
+  replayButton.style.transform = 'translate(-50%, -50%)';
+  replayButton.style.padding = '0.6rem 1.6rem';
+  replayButton.style.borderRadius = '999px';
+  replayButton.style.border = '1px solid rgba(255,255,255,0.5)';
+  replayButton.style.background = 'rgba(255,255,255,0.15)';
+  replayButton.style.color = '#f7f1e8';
+  replayButton.style.backdropFilter = 'blur(6px)';
+  replayButton.style.fontFamily = '"Noto Sans KR", sans-serif';
+  replayButton.style.fontSize = '16px';
+  replayButton.style.letterSpacing = '0.05em';
+  replayButton.style.cursor = 'pointer';
+  replayButton.style.display = 'none';
+  replayButton.style.transition = 'opacity 0.3s ease';
+  replayButton.addEventListener('click', () => {
+    resetExperience();
+  });
+  document.body.appendChild(replayButton);
+}
+
+function showReplayButton() {
+  ensureReplayButton();
+  if (replayButton) {
+    replayButton.style.display = 'block';
+    replayButton.style.opacity = '1';
+  }
+}
+
+function hideReplayButton() {
+  if (replayButton) {
+    replayButton.style.display = 'none';
+    replayButton.style.opacity = '0';
+  }
+}
+
+function triggerEnding() {
+  if (endingState.active) {
+    return;
+  }
+  experienceMode = 'ending';
+  endingState.active = true;
+  endingState.progress = 0;
+  endingState.indoorSteam = 0;
+  setWindTargetAmplitude(6);
+  if (AudioMix.playWind) {
+    AudioMix.playWind({ gain: 0 });
+  }
+  if (AudioMix.playIndoorFire) {
+    AudioMix.playIndoorFire({ loop: true });
+  }
+  showReplayButton();
+}
+
+function updateEnding(delta) {
+  endingState.progress = clamp(endingState.progress + delta * 0.25, 0, 1);
+  endingState.indoorSteam += delta;
+}
+
+function drawEndingOverlay() {
+  const fade = endingState.progress;
+  if (fade <= 0) {
+    return;
+  }
+  ctx.save();
+  ctx.fillStyle = `rgba(0, 0, 0, ${Math.min(0.8, fade)})`;
+  ctx.fillRect(0, 0, viewWidth, viewHeight);
+
+  ctx.globalAlpha = fade;
+  const gradient = ctx.createLinearGradient(0, 0, 0, viewHeight);
+  gradient.addColorStop(0, '#2b1a1a');
+  gradient.addColorStop(1, '#a0572f');
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, 0, viewWidth, viewHeight);
+
+  ctx.fillStyle = 'rgba(220, 180, 120, 0.7)';
+  ctx.beginPath();
+  ctx.arc(viewWidth * 0.72, viewHeight * 0.55, 70, 0, Math.PI * 2);
+  ctx.fill();
+
+  ctx.fillStyle = 'rgba(30, 17, 10, 0.8)';
+  ctx.fillRect(viewWidth * 0.2, viewHeight * 0.65, viewWidth * 0.6, viewHeight * 0.08);
+
+  const mugX = viewWidth * 0.45;
+  const mugY = viewHeight * 0.63;
+  ctx.fillStyle = 'rgba(245, 230, 220, 0.9)';
+  ctx.fillRect(mugX - 18, mugY - 46, 36, 46);
+  ctx.beginPath();
+  ctx.arc(mugX, mugY - 46, 18, Math.PI, 0);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(245, 230, 220, 0.5)';
+  ctx.beginPath();
+  ctx.arc(mugX + 22, mugY - 26, 16, Math.PI * 0.5, Math.PI * 1.5);
+  ctx.fill();
+
+  const steamPhase = endingState.indoorSteam;
+  ctx.strokeStyle = 'rgba(255, 255, 255, 0.6)';
+  ctx.lineWidth = 3;
+  for (let i = 0; i < 3; i += 1) {
+    const offset = (i - 1) * 8;
+    const sway = Math.sin(steamPhase * 1.2 + i * 1.4) * 6;
+    ctx.beginPath();
+    ctx.moveTo(mugX + offset, mugY - 50);
+    ctx.bezierCurveTo(
+      mugX + offset + sway,
+      mugY - 90,
+      mugX + offset - sway * 0.5,
+      mugY - 120,
+      mugX + offset + sway * 0.4,
+      mugY - 150,
+    );
+    ctx.stroke();
+  }
+
+  ctx.restore();
+
+  ctx.save();
+  ctx.globalAlpha = fade;
+  ctx.fillStyle = '#f9f3ec';
+  ctx.font = '28px "Noto Sans KR", sans-serif';
+  ctx.textAlign = 'center';
+  ctx.fillText('따뜻함이 손끝으로 번진다.', viewWidth * 0.5, viewHeight * 0.42);
+  ctx.restore();
+}
+
+function resetSnowflakes() {
+  snowflakes.length = 0;
+  adjustSnowflakes();
+}
+
+function resetWolfState() {
+  wolfState.active = false;
+  wolfState.withdraw = false;
+  wolfState.calm = false;
+  wolfState.focusTime = 0;
+  wolfState.spawnJourneyTime = 0;
+  wolfState.withdrawJourneyTime = 0;
+  wolfState.growlBoosted = false;
+}
+
+function resetReindeerState() {
+  reindeerState.active = false;
+  reindeerState.progress = 0;
+}
+
+function resetExperience() {
+  experienceMode = 'journey';
+  endingState.active = false;
+  endingState.progress = 0;
+  endingState.indoorSteam = 0;
+  hideReplayButton();
+  journeyTime = 0;
+  groundScrollDistance = 0;
+  worldTime = 0;
+  zooming = false;
+  zoomStartRealTime = latestRealTime;
+  breathState = 'idle';
+  lastBreathState = 'idle';
+  lastBreathPuffRealTime = -Infinity;
+  breathPuffs.length = 0;
+  if (AudioMix.stopZoomBreath) {
+    AudioMix.stopZoomBreath();
+  }
+  windState.blizzard = false;
+  windState.gustTimer = 0;
+  setWindTargetAmplitude(windState.baseAmplitude);
+  windState.amplitude = windState.baseAmplitude;
+  walkSpeedMultiplier = 1;
+  snowDensityMultiplier = 1;
+  resetJourneyTargets();
+  resetSnowflakes();
+  resetWolfState();
+  resetReindeerState();
+  resetHut();
+  if (!eventDirector) {
+    eventDirector = new EventDirector();
+  } else {
+    eventDirector.reset();
+  }
+  if (AudioMix.playWind) {
+    AudioMix.playWind();
+  }
+}
+
 function render(timestamp) {
   const realTime = timestamp / 1000;
   const delta = Math.max(0, realTime - lastFrameRealTime);
@@ -353,11 +1073,32 @@ function render(timestamp) {
 
   updateAimDirection();
 
-  if (!zooming) {
-    worldTime = (worldTime + delta / WORLD_TIME_CYCLE) % 1;
+  if (experienceMode === 'journey' && !zooming) {
+    journeyTime += delta;
+    groundScrollDistance += delta * JOURNEY_BASE_SPEED * walkSpeedMultiplier;
+  }
+
+  worldTime = (journeyTime % WORLD_TIME_CYCLE) / WORLD_TIME_CYCLE;
+
+  if (eventDirector) {
+    eventDirector.update(journeyTime, delta);
+  }
+
+  updateWindState(delta);
+  updateSnowflakes(delta, realTime);
+  updateWolfState(delta);
+  updateReindeer(delta);
+  updateHutProgress();
+
+  if (experienceMode === 'journey' && groundScrollDistance >= targetDistance) {
+    triggerEnding();
   }
 
   updateBreath(realTime, delta);
+
+  if (endingState.active) {
+    updateEnding(delta);
+  }
 
   const palette = getWorldPalette(worldTime);
   drawWorld(palette);
@@ -367,6 +1108,10 @@ function render(timestamp) {
 
   if (palette.period === 'night') {
     applyNightLighting(zooming);
+  }
+
+  if (endingState.active) {
+    drawEndingOverlay();
   }
 
   window.requestAnimationFrame(render);
@@ -426,7 +1171,16 @@ function init() {
   });
   window.addEventListener('contextmenu', (event) => event.preventDefault());
 
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter' && endingState.active) {
+      resetExperience();
+    }
+  });
+
   AudioMix.loadAll().catch(() => undefined);
+
+  ensureReplayButton();
+  resetExperience();
 
   window.requestAnimationFrame(render);
 }
