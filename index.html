@@ -9,64 +9,10 @@
   </head>
   <body>
     <h1 class="visually-hidden">Snow-Field</h1>
-    <canvas id="scene"></canvas>
-    <div class="hud" id="hud">
-      <button
-        id="sound-toggle"
-        class="hud-button"
-        type="button"
-        aria-label="Toggle sound"
-        aria-pressed="false"
-      >
-        <span aria-hidden="true" class="hud-icon">🔇</span>
-      </button>
-      <button
-        id="quality-toggle"
-        class="hud-button"
-        type="button"
-        aria-label="Toggle visual quality"
-        aria-pressed="true"
-      >
-        <span aria-hidden="true" class="hud-icon">HQ</span>
-      </button>
-      <button
-        id="info-button"
-        class="hud-button"
-        type="button"
-        aria-label="Show instructions"
-        aria-haspopup="dialog"
-        aria-expanded="false"
-        aria-controls="info-overlay"
-      >
-        <span aria-hidden="true" class="hud-icon">i</span>
-      </button>
+    <canvas id="scene" aria-label="Quiet winter field"></canvas>
+    <div class="hud">
+      <button id="btn-audio" aria-pressed="true" title="Toggle sound">🔈</button>
+      <span id="hud-info"></span>
     </div>
-    <div
-      class="info-overlay"
-      id="info-overlay"
-      hidden
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="info-title"
-    >
-      <div class="info-panel">
-        <h2 id="info-title">Field notes</h2>
-        <p>Take a quiet moment in the snow:</p>
-        <ul>
-          <li>Right-click and hold to zoom your focus.</li>
-          <li>Move the mouse to guide the wanderer's gaze.</li>
-          <li>Press <kbd>C</kbd> to toggle captions for audio cues.</li>
-          <li>Press <kbd>Enter</kbd> to restart after the ending.</li>
-        </ul>
-        <p class="info-note">Sound and quality preferences are saved on this device.</p>
-        <button type="button" class="hud-button info-close" data-close>Close</button>
-      </div>
-    </div>
-    <div
-      id="caption-bar"
-      class="caption-bar"
-      aria-live="polite"
-      aria-atomic="true"
-    ></div>
   </body>
 </html>
