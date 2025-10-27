@@ -59,6 +59,11 @@ const State = {
   realTime: 0,
   quality: 'medium',
   rngSeed: 1337,
+  walk: {
+    base: 80,
+    jitterAmp: 0.08,
+    fatigueNoiseSpeed: 0.1,
+  },
 };
 
 let dpr = window.devicePixelRatio || 1;
@@ -66,9 +71,36 @@ let lastTime = performance.now();
 let fps = 0;
 const FPS_SMOOTHING = 0.92;
 let particleSystem = null;
+let groundScroll = 0;
+let stepTimer = 0.35;
+let nextStepSide = 'left';
+let currentWalkSpeed = State.walk.base;
+let currentWalkSpeedNormalized = 1;
+let heroSprite = null;
+let heroSpriteReady = false;
 
 function randomRange(min, max) {
   return min + Math.random() * (max - min);
+}
+
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
+}
+
+function loadHeroSprite() {
+  try {
+    heroSprite = new Image();
+    heroSprite.decoding = 'async';
+    heroSprite.src = 'assets/sprites/hero_waist_back.png';
+    heroSprite.addEventListener('load', () => {
+      heroSpriteReady = true;
+    });
+    heroSprite.addEventListener('error', (err) => {
+      console.warn('Hero sprite unavailable, using fallback silhouette', err);
+    });
+  } catch (err) {
+    console.warn('Hero sprite load skipped, using fallback silhouette', err);
+  }
 }
 
 class ParticleSystem {
@@ -273,20 +305,81 @@ function drawBackground(width, height) {
   ctx.fillRect(0, 0, width, height);
 }
 
+function drawGround(width, height) {
+  const anchorY = height * 0.72;
+  const bandTop = anchorY - height * 0.12;
+  const bandHeight = height - bandTop;
+  const gradient = ctx.createLinearGradient(0, bandTop, 0, bandTop + bandHeight);
+  gradient.addColorStop(0, 'rgba(199, 211, 226, 0.65)');
+  gradient.addColorStop(0.5, 'rgba(165, 182, 206, 0.85)');
+  gradient.addColorStop(1, 'rgba(129, 150, 178, 0.95)');
+
+  ctx.save();
+  ctx.fillStyle = gradient;
+  ctx.fillRect(0, bandTop, width, bandHeight);
+
+  const layerCount = 18;
+  const baseSpacing = 26;
+
+  for (let i = 0; i < layerCount; i += 1) {
+    const depth = i / layerCount;
+    const eased = depth * depth;
+    const yBase = anchorY + eased * (height - anchorY);
+    const speedScale = 1 + depth * 1.6;
+    const offset = (groundScroll * speedScale) % baseSpacing;
+    const y = yBase - offset;
+    if (y < bandTop - baseSpacing || y > height + baseSpacing) {
+      continue;
+    }
+
+    const dotSpacing = baseSpacing * (0.6 + depth * 1.8);
+    const size = Math.max(0.8, (1 - depth) * 2.6);
+    const alpha = 0.18 + (1 - depth) * 0.12;
+    ctx.globalAlpha = alpha;
+    ctx.fillStyle = '#9baec7';
+
+    for (let x = -dotSpacing; x < width + dotSpacing; x += dotSpacing) {
+      const jitter = perlin2(
+        x * 0.05 + depth * 8.2,
+        State.worldTime * 0.35 + depth * 3.8,
+      );
+      const perspectiveShift = (x - width / 2) * depth * 0.05;
+      const dotX = x + jitter * dotSpacing * 0.25 - perspectiveShift;
+      ctx.beginPath();
+      ctx.arc(dotX, y, size, 0, Math.PI * 2);
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+}
+
 function drawHero(width, height) {
   const heroWidth = width * 0.12;
   const heroHeight = height * 0.25;
-  const heroX = (width - heroWidth) / 2;
-  const heroY = height - heroHeight - height * 0.05;
-  const radius = Math.min(heroWidth, heroHeight) * 0.2;
+  const anchorX = width * 0.5;
+  const anchorY = height * 0.72;
+  const heroX = anchorX - heroWidth / 2;
+  const heroY = anchorY - heroHeight;
 
+  if (heroSpriteReady && heroSprite) {
+    ctx.drawImage(heroSprite, heroX, heroY, heroWidth, heroHeight);
+    return;
+  }
+
+  const radius = Math.min(heroWidth, heroHeight) * 0.2;
   ctx.fillStyle = '#334866';
   ctx.beginPath();
   ctx.moveTo(heroX + radius, heroY);
   ctx.lineTo(heroX + heroWidth - radius, heroY);
   ctx.quadraticCurveTo(heroX + heroWidth, heroY, heroX + heroWidth, heroY + radius);
   ctx.lineTo(heroX + heroWidth, heroY + heroHeight - radius);
-  ctx.quadraticCurveTo(heroX + heroWidth, heroY + heroHeight, heroX + heroWidth - radius, heroY + heroHeight);
+  ctx.quadraticCurveTo(
+    heroX + heroWidth,
+    heroY + heroHeight,
+    heroX + heroWidth - radius,
+    heroY + heroHeight,
+  );
   ctx.lineTo(heroX + radius, heroY + heroHeight);
   ctx.quadraticCurveTo(heroX, heroY + heroHeight, heroX, heroY + heroHeight - radius);
   ctx.lineTo(heroX, heroY + radius);
@@ -295,7 +388,7 @@ function drawHero(width, height) {
   ctx.fill();
 
   const headRadius = heroWidth * 0.35;
-  const headX = width / 2;
+  const headX = anchorX;
   const headY = heroY - headRadius * 0.2;
 
   ctx.fillStyle = '#f0f4fa';
@@ -315,6 +408,7 @@ function render() {
     particleSystem.drawLayer(ctx, 'far');
     particleSystem.drawLayer(ctx, 'mid');
   }
+  drawGround(width, height);
   drawHero(width, height);
   if (particleSystem) {
     particleSystem.drawLayer(ctx, 'near');
@@ -371,6 +465,36 @@ function cycleQuality() {
   applyQuality(QUALITY_ORDER[nextIndex]);
 }
 
+function triggerFootstep(speedNormalized) {
+  const interval = clamp(0.48 - speedNormalized * 0.2, 0.28, 0.55);
+  const hasDirectional = AudioMix.hasDirectionalSteps();
+  const side = hasDirectional ? nextStepSide : null;
+  AudioMix.playStep(side);
+  console.log(hasDirectional ? `step:${side}` : 'step');
+  if (hasDirectional) {
+    nextStepSide = nextStepSide === 'left' ? 'right' : 'left';
+  }
+  stepTimer += interval;
+}
+
+function updateWalk(dt) {
+  const { base, jitterAmp, fatigueNoiseSpeed } = State.walk;
+  const fatigueSample = perlin2(State.worldTime * fatigueNoiseSpeed, 3.1) * 2 - 1;
+  const jitter = fatigueSample * jitterAmp;
+  currentWalkSpeed = base * (1 + jitter);
+  currentWalkSpeedNormalized = currentWalkSpeed / base;
+  AudioMix.setWindFromSpeed(currentWalkSpeedNormalized);
+
+  const patternLength = 320;
+  if (!State.zooming) {
+    groundScroll = (groundScroll + currentWalkSpeed * dt) % patternLength;
+    stepTimer -= dt;
+    while (stepTimer <= 0) {
+      triggerFootstep(currentWalkSpeedNormalized);
+    }
+  }
+}
+
 function tick() {
   const now = performance.now();
   let dt = now - lastTime;
@@ -398,6 +522,8 @@ function tick() {
     particleSystem.update(dt, State.worldTime);
   }
 
+  updateWalk(dt);
+
   render();
   updateHud();
 
@@ -406,6 +532,7 @@ function tick() {
 }
 
 function init() {
+  loadHeroSprite();
   loadQuality();
   particleSystem = new ParticleSystem();
   resizeCanvas();
@@ -421,10 +548,19 @@ function init() {
     if (event.key === 'q' || event.key === 'Q') {
       event.preventDefault();
       cycleQuality();
+    } else if (event.key === 'm' || event.key === 'M') {
+      event.preventDefault();
+      AudioMix.toggleMute();
+      console.log(`Audio mute: ${AudioMix.isMuted() ? 'on' : 'off'}`);
     }
   });
 
-  AudioMix.loadAll().catch((err) => console.warn('Audio preload failed', err));
+  AudioMix.loadAll()
+    .then(() => {
+      AudioMix.setWindFromSpeed(currentWalkSpeedNormalized);
+      AudioMix.playWind(true);
+    })
+    .catch((err) => console.warn('Audio preload failed', err));
   AudioMix.setMuted(true);
 
   console.log('Snow-Field v0.1 loop ok');
